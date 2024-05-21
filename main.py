@@ -7,6 +7,7 @@ import uuid
 from loguru import logger
 from keep_alive import keep_alive
 from websockets_proxy import Proxy, proxy_connect
+keep_alive()
 
 async def connect_to_wss(socks5_proxy, user_id):
     device_id = str(uuid.uuid3(uuid.NAMESPACE_DNS, socks5_proxy))
@@ -77,4 +78,3 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
-keep_alive()
