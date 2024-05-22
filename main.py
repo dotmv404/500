@@ -4,10 +4,16 @@ import ssl
 import json
 import time
 import uuid
+from datetime import datetime, timedelta
 from loguru import logger
 from keep_alive import keep_alive
 from websockets_proxy import Proxy, proxy_connect
+
 keep_alive()
+
+# Configurable time window (UTC)
+START_HOUR = 18  # 6 PM UTC
+END_HOUR = 1  # 1 AM UTC
 
 async def connect_to_wss(socks5_proxy, user_id):
     device_id = str(uuid.uuid3(uuid.NAMESPACE_DNS, socks5_proxy))
@@ -74,7 +80,19 @@ async def main():
     _user_id = '2fItNI22plTwaGamzYFVKou5OzC'
     with open('proxy.txt', 'r') as file:
         socks5_proxy_list = [line.strip() for line in file if line.strip()]
-    await asyncio.gather(*(connect_to_wss(proxy, _user_id) for proxy in socks5_proxy_list))
+
+    # Time check to ensure the script runs only within the specified time window (UTC)
+    while True:
+        current_time = datetime.utcnow()
+        if START_HOUR <= current_time.hour or current_time.hour < END_HOUR:
+            await asyncio.gather(*(connect_to_wss(proxy, _user_id) for proxy in socks5_proxy_list))
+        else:
+            next_run_time = datetime.combine(current_time.date(), datetime.min.time()) + timedelta(hours=START_HOUR)
+            if current_time.hour >= END_HOUR:
+                next_run_time += timedelta(days=1)
+            sleep_seconds = (next_run_time - current_time).total_seconds()
+            logger.info(f"Current time is {current_time}. Sleeping for {sleep_seconds} seconds until the next run window.")
+            await asyncio.sleep(sleep_seconds)
 
 if __name__ == '__main__':
     asyncio.run(main())
