@@ -12,7 +12,7 @@ from websockets_proxy import Proxy, proxy_connect
 keep_alive()
 
 # Configurable time window (UTC)
-START_HOUR = 18  # 6 PM UTC
+START_HOUR = 11  # 6 PM UTC
 END_HOUR = 1  # 1 AM UTC
 
 async def connect_to_wss(socks5_proxy, user_id):
