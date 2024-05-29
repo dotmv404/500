@@ -1,98 +1,153 @@
 import asyncio
 import random
-import ssl
 import json
-import time
 import uuid
-from datetime import datetime, timedelta
+import time
 from loguru import logger
+import aiohttp
+import aiohttp_proxy
+from websockets import connect
+from websockets.exceptions import ConnectionClosedError
 from keep_alive import keep_alive
-from websockets_proxy import Proxy, proxy_connect
-
 keep_alive()
+WEBSOCKET_URL = "wss://nw.nodepay.ai:4576/websocket"
+RETRY_INTERVAL = 60  # seconds
+PING_INTERVAL = 10  # seconds
+retries = 0
 
-# Configurable time window (UTC)
-START_HOUR = 11  # 6 PM UTC
-END_HOUR = 1  # 1 AM UTC
+CONNECTION_STATES = {
+    'CONNECTING': 0,  # Socket has been created. The connection is not yet open.
+    'OPEN': 1,  # The connection is open and ready to communicate.
+    'CLOSING': 2,  # The connection is in the process of closing.
+    'CLOSED': 3,  # The connection is closed or couldn't be opened.
+}
 
-async def connect_to_wss(socks5_proxy, user_id):
-    device_id = str(uuid.uuid3(uuid.NAMESPACE_DNS, socks5_proxy))
-    logger.info(f"Device ID: {device_id}")
-    custom_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+def uuidv4():
+    return str(uuid.uuid4())
+
+device_id = uuidv4()
+browser_id = uuidv4()
+socket = None
+logger.info(f"Device ID: {browser_id}")
+
+local_storage = {}
+sync_storage = {}
+
+def to_json(response):
+    if response.ok:
+        return response.json()
+    return response.raise_for_status()
+
+def valid_resp(resp):
+    if 'code' in resp and resp['code'] < 0:
+        raise ValueError(resp)
+    return resp
+
+async def call_api_info(token, proxy_url):
+    headers = {'Content-Type': 'application/json'}
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://sandbox-api.nodepay.ai/api/auth/session", headers=headers, proxy=proxy_url) as response:
+            return valid_resp(await to_json(response))
+
+async def send_ping(socket, guid, options={}):
+    payload = {
+        'id': guid,
+        'action': 'PING',
+        **options,
     }
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
-    uri = "wss://proxy.wynd.network:4650/"
-    server_hostname = "proxy.wynd.network"
-    proxy = Proxy.from_url(socks5_proxy)
+    try:
+        if socket.state == CONNECTION_STATES['OPEN']:
+            await socket.send(json.dumps(payload))
+            logger.info(f"Sent PING with ID: {guid} and options: {options}")
+    except Exception as e:
+        logger.error(f"Error sending PING: {e}")
 
-    while True:
-        try:
-            async with proxy_connect(uri, proxy=proxy, ssl=ssl_context, server_hostname=server_hostname,
-                                     extra_headers=custom_headers) as websocket:
-                async def send_ping():
+async def send_pong(socket, guid):
+    payload = {
+        'id': guid,
+        'origin_action': 'PONG',
+    }
+    try:
+        if socket.state == CONNECTION_STATES['OPEN']:
+            await socket.send(json.dumps(payload))
+            logger.info(f"Sent PONG with ID: {guid}")
+    except Exception as e:
+        logger.error(f"Error sending PONG: {e}")
+
+async def connect_socket(token, proxy_url):
+    global socket, retries, browser_id
+    browser_id = uuidv4()
+
+    if not browser_id:
+        logger.warning("[INITIALIZE] Browser ID is blank. Cancelling connection...")
+        browser_id = device_id
+        sync_storage['browser_id'] = browser_id
+        await connect_socket(token, proxy_url)
+        return
+
+    if socket and socket.state in [CONNECTION_STATES['OPEN'], CONNECTION_STATES['CONNECTING']]:
+        logger.info("Socket already active or connecting")
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://sandbox-api.nodepay.ai/api/auth/session", proxy=proxy_url) as response:
+                logger.info(f"HTTP response status: {response.status}")
+                async with connect(WEBSOCKET_URL, extra_headers={"Proxy-Authorization": proxy_url}) as websocket:
+                    socket = websocket
+                    local_storage['status_ws'] = CONNECTION_STATES['OPEN']
+                    logger.info("WebSocket connection established")
+
                     while True:
                         try:
-                            send_message = json.dumps(
-                                {"id": str(uuid.uuid4()), "version": "1.0.0", "action": "PING", "data": {}})
-                            logger.debug(f"Sending PING: {send_message}")
-                            await websocket.send(send_message)
-                            await asyncio.sleep(20)
-                        except Exception as e:
-                            logger.error(f"Error in send_ping: {e}")
+                            message = await socket.recv()
+                            data = json.loads(message)
+                            logger.info(f"Received message: {data}")
+
+                            if data.get('action') == 'PONG':
+                                await send_pong(socket, data['id'])
+                                await asyncio.sleep(PING_INTERVAL)
+                                await send_ping(socket, data['id'])
+                            elif data.get('action') == 'AUTH':
+                                res = await call_api_info(token, proxy_url)
+                                if res['code'] == 0 and res['data']['uid']:
+                                    local_storage['accountInfo'] = res['data']
+                                    data_info = {
+                                        'user_id': '1245399962284457984',
+                                        'browser_id': browser_id,
+                                        'user_agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                                        'timestamp': int(time.time()),
+                                        'device_type': 'extension',
+                                        'version': '1.0',
+                                        'token': token,
+                                        'origin_action': 'AUTH',
+                                    }
+                                    await send_ping(socket, data['id'], data_info)
+                                    logger.info(f"Sent AUTH PING with data: {data_info}")
+
+                        except ConnectionClosedError:
+                            local_storage['status_ws'] = CONNECTION_STATES['CLOSED']
+                            logger.warning("[close] Connection died")
+                            await asyncio.sleep(RETRY_INTERVAL)
+                            await connect_socket(token, proxy_url)
+                            retries += 1
                             break
 
-                # Start the ping task after connection is established
-                asyncio.create_task(send_ping())
+    except Exception as e:
+        local_storage['status_ws'] = CONNECTION_STATES['CLOSED']    
+        logger.error(f"Connection error: {e}")
 
-                async for response in websocket:
-                    message = json.loads(response)
-                    logger.info(f"Received message: {message}")
-                    if message.get("action") == "AUTH":
-                        auth_response = {
-                            "id": message["id"],
-                            "origin_action": "AUTH",
-                            "result": {
-                                "browser_id": device_id,
-                                "user_id": user_id,
-                                "user_agent": custom_headers['User-Agent'],
-                                "timestamp": int(time.time()),
-                                "device_type": "extension",
-                                "version": "2.5.0"
-                            }
-                        }
-                        logger.debug(f"Sending AUTH response: {auth_response}")
-                        await websocket.send(json.dumps(auth_response))
+async def check_permission(proxy_url):
+    token = "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiIxMjQ1Mzk5OTYyMjg0NDU3OTg0IiwiaWF0IjoxNzE3MDEzNTM1LCJleHAiOjE3MTgyMjMxMzV9.m6RY0SpXpiaWJRHoq1d0G8yYAE0IGhaqxh3AU9hlMQmJHFYMrCQWm2YXJczq6-gA0YVw-ThKJFrM8Klicv2cQw"
+    if token:
+        await connect_socket(token, proxy_url)
+    else:
+        logger.info("Redirecting to login...")
 
-                    elif message.get("action") == "PONG":
-                        pong_response = {"id": message["id"], "origin_action": "PONG"}
-                        logger.debug(f"Sending PONG response: {pong_response}")
-                        await websocket.send(json.dumps(pong_response))
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            logger.error(f"Proxy: {socks5_proxy}")
-            # Add a delay before retrying the connection
-            await asyncio.sleep(5)
-
-async def main():
-    _user_id = '2fItNI22plTwaGamzYFVKou5OzC'
-    with open('proxy.txt', 'r') as file:
-        socks5_proxy_list = [line.strip() for line in file if line.strip()]
-
-    # Time check to ensure the script runs only within the specified time window (UTC)
-    while True:
-        current_time = datetime.utcnow()
-        if START_HOUR <= current_time.hour or current_time.hour < END_HOUR:
-            await asyncio.gather(*(connect_to_wss(proxy, _user_id) for proxy in socks5_proxy_list))
-        else:
-            next_run_time = datetime.combine(current_time.date(), datetime.min.time()) + timedelta(hours=START_HOUR)
-            if current_time.hour >= END_HOUR:
-                next_run_time += timedelta(days=1)
-            sleep_seconds = (next_run_time - current_time).total_seconds()
-            logger.info(f"Current time is {current_time}. Sleeping for {sleep_seconds} seconds until the next run window.")
-            await asyncio.sleep(sleep_seconds)
-
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    logger.info("Starting script")
+    # Update the proxy URL format to include the protocol scheme properly
+    proxy_url = "http://customer-itzmiru-sessid-0094298613-sesstime-30:Miru9899091miru@pr.oxylabs.io:7777"
+    asyncio.run(check_permission(proxy_url))
